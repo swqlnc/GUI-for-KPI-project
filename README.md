@@ -45,6 +45,14 @@ py -3.13 -m venv .venv
 
 У показаній демонстрації використано [HHD Virtual Serial Ports](https://hhdsoftware.com/virtual-serial-ports): **Devices → Create Local Bridge…**, пара **COM7 ↔ COM8**. Умови ліцензії та пробної версії перевіряйте на сайті виробника. Якщо ці номери зайняті, виберіть інші та замініть їх у командах нижче.
 
+Відкрийте меню **Devices** та виберіть **Create Local Bridge…**:
+
+![Пункт Create Local Bridge у меню Devices](docs/images/hhd-create-bridge.png)
+
+У вікні створення задайте два вільні порти, наприклад **COM7** і **COM8**, та підтвердьте. У списку **Local Bridges** має з'явитися з'єднання **COM7 ↔ COM8**:
+
+![Створена віртуальна пара COM7 і COM8 у Local Bridges](docs/images/hhd-port-pair.png)
+
 Перевірте порти з папки проєкту:
 
 ```powershell
