@@ -7,7 +7,6 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -56,11 +55,6 @@ QPushButton {
 LED_OFF = "background-color: #4a4740; border-radius: 5px;"
 LED_ON = "background-color: #55d17a; border-radius: 5px;"
 
-PLACEHOLDER_STYLE = """
-QFrame { border: 1px dashed #38352f; border-radius: 6px; }
-QLabel { color: #8c887d; }
-"""
-
 
 class MainWindow(QMainWindow):
     """Головне вікно з прийомом сирих даних COM-порту через таймер."""
@@ -68,7 +62,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Прийом даних з COM-порту")
-        self.resize(680, 420)
+        self.resize(1000, 540)
         self.setStyleSheet(STYLE)
         self.connected = False
         self.serial_port = None
@@ -88,7 +82,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         root.addLayout(self._build_control_row())
-        root.addLayout(self._build_placeholders())
+        root.addLayout(self._build_data_views())
         root.addStretch()
 
         self._refresh_ports()
@@ -139,13 +133,14 @@ class MainWindow(QMainWindow):
 
         return row
 
-    def _build_placeholders(self) -> QVBoxLayout:
+    def _build_data_views(self) -> QVBoxLayout:
         col = QVBoxLayout()
 
         charts_row = QHBoxLayout()
         self.channel_plot = self._create_plot("Графік 1", CHANNEL_NAMES[:3])
-        charts_row.addWidget(self.channel_plot)
-        charts_row.addWidget(self._placeholder_frame("Графік 2", min_height=140))
+        self.channel_plot_2 = self._create_plot("Графік 2", CHANNEL_NAMES[3:])
+        charts_row.addWidget(self.channel_plot, stretch=1)
+        charts_row.addWidget(self.channel_plot_2, stretch=1)
         col.addLayout(charts_row)
 
         self.data_log = QPlainTextEdit()
@@ -172,17 +167,6 @@ class MainWindow(QMainWindow):
         for name, color in zip(names, CHANNEL_COLORS):
             self.channel_curves[name] = plot.plot(name=name, pen=pg.mkPen(color, width=2))
         return plot
-
-    @staticmethod
-    def _placeholder_frame(title: str, min_height: int) -> QFrame:
-        frame = QFrame()
-        frame.setStyleSheet(PLACEHOLDER_STYLE)
-        frame.setMinimumHeight(min_height)
-        layout = QVBoxLayout(frame)
-        label = QLabel(title)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
-        return frame
 
     def _refresh_ports(self) -> None:
         self.port_combo.clear()
