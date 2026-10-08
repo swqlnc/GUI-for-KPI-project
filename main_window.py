@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
 from serial.tools import list_ports
 
 BAUD_RATES = [9600, 57600, 115200]
+CHANNEL_NAMES = ("X1", "Y1", "Z1", "X2", "Y2", "Z2")
+CHANNEL_COLORS = ("#6fdc8c", "#e0a94a", "#5ea7b8")
 
 STYLE = """
 QMainWindow { background-color: #1b1a17; }
@@ -74,7 +76,9 @@ class MainWindow(QMainWindow):
         self._skip_plot_line = False
         self._sample_number = 0
         self._sample_numbers = deque(maxlen=500)
-        self._sample_values = deque(maxlen=500)
+        self._sample_values = {name: deque(maxlen=500) for name in CHANNEL_NAMES}
+        self._plots_dirty = False
+        self.channel_curves = {}
         self.read_timer = QTimer(self)
         self.read_timer.setInterval(50)
         self.read_timer.timeout.connect(self._read_serial_data)
@@ -88,6 +92,10 @@ class MainWindow(QMainWindow):
         root.addStretch()
 
         self._refresh_ports()
+        self.render_timer = QTimer(self)
+        self.render_timer.setInterval(30)
+        self.render_timer.timeout.connect(self._render_plots)
+        self.render_timer.start()
 
     def _build_control_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -135,17 +143,7 @@ class MainWindow(QMainWindow):
         col = QVBoxLayout()
 
         charts_row = QHBoxLayout()
-        self.channel_plot = pg.PlotWidget(background="#0c1310")
-        self.channel_plot.setMinimumHeight(180)
-        self.channel_plot.setTitle("Канал 1 · x1", color="#d8d3c7")
-        self.channel_plot.setLabel("bottom", "Номер відліку")
-        self.channel_plot.setLabel("left", "Значення")
-        self.channel_plot.showGrid(x=True, y=True, alpha=0.15)
-        for name in ("bottom", "left"):
-            axis = self.channel_plot.getAxis(name)
-            axis.setPen(pg.mkPen("#8c887d"))
-            axis.setTextPen(pg.mkPen("#d8d3c7"))
-        self.channel_curve = self.channel_plot.plot(pen=pg.mkPen("#55d17a", width=2))
+        self.channel_plot = self._create_plot("Графік 1", CHANNEL_NAMES[:3])
         charts_row.addWidget(self.channel_plot)
         charts_row.addWidget(self._placeholder_frame("Графік 2", min_height=140))
         col.addLayout(charts_row)
@@ -157,6 +155,23 @@ class MainWindow(QMainWindow):
         self.data_log.setMinimumHeight(100)
         col.addWidget(self.data_log)
         return col
+
+    def _create_plot(self, title: str, names: tuple[str, ...]) -> pg.PlotWidget:
+        plot = pg.PlotWidget(background="#0c1310")
+        plot.setMinimumHeight(180)
+        plot.setTitle(title, color="#d8d3c7")
+        plot.setLabel("bottom", "Номер відліку", color="#8c887d")
+        plot.setLabel("left", "Значення", color="#8c887d")
+        plot.showGrid(x=True, y=True, alpha=0.15)
+        plot.enableAutoRange(axis="y", enable=True)
+        for name in ("bottom", "left"):
+            axis = plot.getAxis(name)
+            axis.setPen(pg.mkPen("#8c887d"))
+            axis.setTextPen(pg.mkPen("#8c887d"))
+        plot.addLegend(labelTextColor="#8c887d", brush="#0c1310", pen="#38352f")
+        for name, color in zip(names, CHANNEL_COLORS):
+            self.channel_curves[name] = plot.plot(name=name, pen=pg.mkPen(color, width=2))
+        return plot
 
     @staticmethod
     def _placeholder_frame(title: str, min_height: int) -> QFrame:
@@ -198,8 +213,11 @@ class MainWindow(QMainWindow):
         self._skip_plot_line = False
         self._sample_number = 0
         self._sample_numbers.clear()
-        self._sample_values.clear()
-        self.channel_curve.setData([], [])
+        for values in self._sample_values.values():
+            values.clear()
+        for curve in self.channel_curves.values():
+            curve.setData([], [])
+        self._plots_dirty = False
         self._update_connection_state()
         self.read_timer.start()
 
@@ -232,9 +250,6 @@ class MainWindow(QMainWindow):
                 self.data_log.setTextCursor(cursor)
                 self.data_log.ensureCursorVisible()
                 self._collect_plot_sample(raw_line)
-            self.channel_curve.setData(
-                list(self._sample_numbers), list(self._sample_values)
-            )
         except (serial.SerialException, OSError) as exc:
             self._disconnect_port()
             QMessageBox.warning(self, "Помилка читання порту", str(exc))
@@ -262,7 +277,17 @@ class MainWindow(QMainWindow):
             return
         self._sample_number += 1
         self._sample_numbers.append(self._sample_number)
-        self._sample_values.append(values[0])
+        for name, value in zip(CHANNEL_NAMES, values):
+            self._sample_values[name].append(value)
+        self._plots_dirty = True
+
+    def _render_plots(self) -> None:
+        if not self._plots_dirty:
+            return
+        sample_numbers = list(self._sample_numbers)
+        for name, curve in self.channel_curves.items():
+            curve.setData(sample_numbers, list(self._sample_values[name]))
+        self._plots_dirty = False
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._disconnect_port()
