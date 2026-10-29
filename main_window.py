@@ -21,6 +21,7 @@ from serial.tools import list_ports
 BAUD_RATES = [9600, 57600, 115200]
 CHANNEL_NAMES = ("X1", "Y1", "Z1", "X2", "Y2", "Z2")
 CHANNEL_COLORS = ("#6fdc8c", "#e0a94a", "#5ea7b8")
+MAX_READ_BYTES = 65536
 
 STYLE = """
 QMainWindow { background-color: #1b1a17; }
@@ -82,8 +83,7 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
 
         root.addLayout(self._build_control_row())
-        root.addLayout(self._build_data_views())
-        root.addStretch()
+        root.addLayout(self._build_data_views(), stretch=1)
 
         self._refresh_ports()
         self.render_timer = QTimer(self)
@@ -141,14 +141,16 @@ class MainWindow(QMainWindow):
         self.channel_plot_2 = self._create_plot("Графік 2", CHANNEL_NAMES[3:])
         charts_row.addWidget(self.channel_plot, stretch=1)
         charts_row.addWidget(self.channel_plot_2, stretch=1)
-        col.addLayout(charts_row)
+        col.addLayout(charts_row, stretch=3)
 
         self.data_log = QPlainTextEdit()
         self.data_log.setReadOnly(True)
         self.data_log.setMaximumBlockCount(500)
         self.data_log.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.data_log.setMinimumHeight(100)
-        col.addWidget(self.data_log)
+        # Resizing changes the scroll range even while reception is stopped.
+        self.data_log.verticalScrollBar().rangeChanged.connect(self._scroll_log_to_bottom)
+        col.addWidget(self.data_log, stretch=1)
         return col
 
     def _create_plot(self, title: str, names: tuple[str, ...]) -> pg.PlotWidget:
@@ -223,20 +225,33 @@ class MainWindow(QMainWindow):
         if self.serial_port is None:
             return
         try:
-            while self.serial_port.in_waiting > 0:
-                raw_line = self.serial_port.readline()
-                if not raw_line:
-                    break
-                # Insert without adding a newline: timeout=0 can return a partial line.
-                cursor = self.data_log.textCursor()
-                cursor.movePosition(QTextCursor.MoveOperation.End)
-                cursor.insertText(raw_line.decode("utf-8", errors="replace"))
-                self.data_log.setTextCursor(cursor)
-                self.data_log.ensureCursorVisible()
-                self._collect_plot_sample(raw_line)
+            # One bounded, nonblocking read per tick: a continuous stream must
+            # not keep the GUI in a readline loop or trigger per-line relayouts.
+            available = min(self.serial_port.in_waiting, MAX_READ_BYTES)
+            if not available:
+                return
+            data = self.serial_port.read(available)
+            if not data:
+                return
+            cursor = self.data_log.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(data.decode("utf-8", errors="replace"))
+            self.data_log.setTextCursor(cursor)
+            self._scroll_log_to_bottom()
+
+            # Preserve partial lines between ticks and the existing validation.
+            parts = data.split(b"\n")
+            for line in parts[:-1]:
+                self._collect_plot_sample(line + b"\n")
+            if parts[-1]:
+                self._collect_plot_sample(parts[-1])
         except (serial.SerialException, OSError) as exc:
             self._disconnect_port()
             QMessageBox.warning(self, "Помилка читання порту", str(exc))
+
+    def _scroll_log_to_bottom(self, *_args) -> None:
+        scrollbar = self.data_log.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def _collect_plot_sample(self, chunk: bytes) -> None:
         # Nonblocking reads can split a sample across timer ticks.
