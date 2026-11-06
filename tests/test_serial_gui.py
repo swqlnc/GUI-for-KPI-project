@@ -1,6 +1,9 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import unittest
+import csv
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 from PySide6.QtCore import QPoint
 from PySide6.QtTest import QTest
@@ -58,6 +61,92 @@ class SerialGuiTests(unittest.TestCase):
         self.window._render_plots()
         for name in CHANNEL_NAMES:
             self.assertEqual(len(self.window.channel_curves[name].getData()[0]), 100)
+
+    def start_recording(self, path):
+        self.window.connected = True
+        self.window._update_connection_state()
+        with patch('main_window.QFileDialog.getSaveFileName', return_value=(str(path), 'CSV (*.csv)')):
+            self.window.record_btn.click()
+
+    def test_csv_records_all_valid_samples_and_stops_on_disconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'дані.csv'
+            self.start_recording(path)
+            self.receive(b'1 2 3')
+            self.receive(b' 4 5 6\ninvalid\nNaN 2 3 4 5 6\n')
+            self.receive(b'7 8 9 10 11 12\n' * 600)
+            self.window._render_plots()
+            with path.open(encoding='utf-8-sig', newline='') as stream:
+                rows = list(csv.reader(stream, delimiter=';'))
+            self.assertEqual(rows[0], ['Sample', *CHANNEL_NAMES])
+            self.assertEqual(len(rows), 602)
+            self.assertEqual(rows[1], ['1', '1.0', '2.0', '3.0', '4.0', '5.0', '6.0'])
+            self.assertEqual(self.window.record_table.rowCount(), 100)
+            self.assertIn('601', self.window.record_info.text())
+            stream = self.window._record_file
+            self.window._disconnect_port()
+            self.assertTrue(stream.closed)
+            self.assertIsNone(self.window._csv_writer)
+            self.assertFalse(self.window.record_btn.isEnabled())
+
+    def test_cancel_stop_and_new_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'first.csv'
+            self.window.connected = True
+            with patch('main_window.QFileDialog.getSaveFileName', return_value=('', '')):
+                self.window._toggle_recording()
+            self.assertIsNone(self.window._record_file)
+            self.start_recording(path)
+            self.receive(b'1 2 3 4 5 6\n')
+            self.window.record_btn.click()
+            self.receive(b'7 8 9 10 11 12\n')
+            self.assertEqual(len(path.read_text(encoding='utf-8-sig').splitlines()), 2)
+            self.start_recording(Path(directory) / 'second')
+            self.assertEqual(self.window.record_table.rowCount(), 0)
+            self.assertEqual(self.window._recorded_rows, 0)
+            self.assertTrue((Path(directory) / 'second.csv').exists())
+            self.window._stop_recording()
+
+    def test_recording_error_keeps_port_connected(self):
+        self.window.connected = True
+        with patch('main_window.QFileDialog.getSaveFileName', return_value=('bad.csv', '')), \
+             patch('builtins.open', side_effect=PermissionError('read only')), \
+             patch('main_window.QMessageBox.warning') as warning:
+            self.window._toggle_recording()
+        warning.assert_called_once()
+        self.assertTrue(self.window.connected)
+        self.assertIsNone(self.window._record_file)
+
+    def test_close_finishes_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.start_recording(Path(directory) / 'close.csv')
+            stream = self.window._record_file
+            self.window.close()
+            self.assertTrue(stream.closed)
+
+    def test_partial_sample_before_recording_is_only_plotted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.receive(b'1 2 3')
+            path = Path(directory) / 'partial.csv'
+            self.start_recording(path)
+            self.receive(b' 4 5 6\n7 8 9 10 11 12\n')
+            self.window._stop_recording()
+            self.assertEqual(self.window._sample_number, 2)
+            self.assertEqual(self.window._recorded_rows, 1)
+            self.assertTrue(path.read_text(encoding='utf-8-sig').splitlines()[1].startswith('2;'))
+
+    def test_disk_write_failure_stops_only_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.start_recording(Path(directory) / 'error.csv')
+            stream = self.window._record_file
+            with patch.object(self.window, '_csv_writer') as writer, \
+                 patch('main_window.QMessageBox.warning') as warning:
+                writer.writerow.side_effect = OSError('Disk full')
+                self.receive(b'1 2 3 4 5 6\n')
+                warning.assert_called_once()
+            self.assertTrue(stream.closed)
+            self.assertTrue(self.window.connected)
+            self.assertEqual(self.window._sample_number, 1)
 
     def test_partial_invalid_and_oversized_lines(self):
         self.receive(b'1 2 3')

@@ -1,4 +1,6 @@
 from collections import deque
+import csv
+from datetime import datetime
 import math
 
 import pyqtgraph as pg
@@ -7,12 +9,18 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +35,12 @@ STYLE = """
 QMainWindow { background-color: #1b1a17; }
 QWidget { color: #d8d3c7; font-family: "Roboto Condensed", sans-serif; font-size: 13px; }
 QLabel#fieldLabel { color: #8c887d; font-size: 11px; }
+QPushButton {
+    background-color: #171614; color: #d8d3c7; border: 1px solid #575249;
+    border-radius: 3px; padding: 7px 10px;
+}
+QPushButton:disabled { color: #6b675f; border-color: #38352f; }
+QPushButton:hover { background-color: #27251f; }
 QComboBox {
     background-color: #171614; border: 1px solid #38352f; border-radius: 3px;
     padding: 5px 8px; font-family: "JetBrains Mono", monospace; font-size: 12px;
@@ -67,6 +81,13 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.connected = False
         self.serial_port = None
+        self._record_file = None
+        self._csv_writer = None
+        self._recorded_rows = 0
+        self._record_preview_rows = deque(maxlen=100)
+        self._record_preview_dirty = False
+        self._record_skip_partial = False
+        self.record_dialog = None
         self._plot_buffer = bytearray()
         self._skip_plot_line = False
         self._sample_number = 0
@@ -119,6 +140,14 @@ class MainWindow(QMainWindow):
         self.connect_btn.setStyleSheet(BTN_DISCONNECTED)
         self.connect_btn.clicked.connect(self._toggle_connection)
         row.addWidget(self.connect_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self.record_btn = QPushButton("Запис у CSV")
+        self.record_btn.setEnabled(False)
+        self.record_btn.clicked.connect(self._toggle_recording)
+        row.addWidget(self.record_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        self.preview_btn = QPushButton("Перегляд запису")
+        self.preview_btn.clicked.connect(self._show_recording_preview)
+        row.addWidget(self.preview_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
         row.addStretch()
 
@@ -209,6 +238,7 @@ class MainWindow(QMainWindow):
 
     def _disconnect_port(self) -> None:
         self.read_timer.stop()
+        self._stop_recording()
         port = self.serial_port
         self.serial_port = None
         self._plot_buffer.clear()
@@ -245,6 +275,11 @@ class MainWindow(QMainWindow):
                 self._collect_plot_sample(line + b"\n")
             if parts[-1]:
                 self._collect_plot_sample(parts[-1])
+            if self._record_file is not None:
+                try:
+                    self._record_file.flush()
+                except OSError as exc:
+                    self._recording_error(exc)
         except (serial.SerialException, OSError) as exc:
             self._disconnect_port()
             QMessageBox.warning(self, "Помилка читання порту", str(exc))
@@ -266,6 +301,8 @@ class MainWindow(QMainWindow):
         self._plot_buffer.clear()
         skip = self._skip_plot_line
         self._skip_plot_line = False
+        skip_record = self._record_skip_partial
+        self._record_skip_partial = False
         if skip:
             return
         try:
@@ -279,8 +316,112 @@ class MainWindow(QMainWindow):
         for name, value in zip(CHANNEL_NAMES, values):
             self._sample_values[name].append(value)
         self._plots_dirty = True
+        if self._csv_writer is not None and not skip_record:
+            try:
+                self._csv_writer.writerow([self._sample_number, *values])
+                self._recorded_rows += 1
+                self._record_preview_rows.append([self._sample_number, *values])
+                self._record_preview_dirty = True
+            except OSError as exc:
+                self._recording_error(exc)
+
+    def _toggle_recording(self) -> None:
+        if self._record_file is not None:
+            self._stop_recording()
+            return
+        if not self.connected:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Запис даних у CSV",
+            datetime.now().strftime("serial_data_%Y%m%d_%H%M%S.csv"),
+            "CSV (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            self._record_file = open(path, "w", encoding="utf-8-sig", newline="")
+            self._csv_writer = csv.writer(self._record_file, delimiter=";")
+            self._csv_writer.writerow(["Sample", *CHANNEL_NAMES])
+            self._record_file.flush()
+        except OSError as exc:
+            self._recording_error(exc)
+            return
+        # Do not include a sample whose first bytes arrived before recording.
+        self._record_skip_partial = bool(self._plot_buffer) or self._skip_plot_line
+        self.record_btn.setText("Зупинити запис")
+        self.record_btn.setStyleSheet(BTN_CONNECTED)
+        self.record_btn.setToolTip(f"Запис у файл: {path}")
+        self._recorded_rows = 0
+        self._record_preview_rows.clear()
+        self._record_preview_dirty = True
+        self._record_path = path
+        self._show_recording_preview()
+        self.record_table.setRowCount(0)
+        self._update_recording_preview()
+
+    def _show_recording_preview(self) -> None:
+        if self.record_dialog is None:
+            self.record_dialog = QDialog(self)
+            self.record_dialog.setWindowTitle("Перегляд запису CSV")
+            self.record_dialog.setStyleSheet("""
+                QDialog { background-color: #1b1a17; }
+                QTableWidget { background-color: #0c1310; color: #d8d3c7; gridline-color: #38352f; }
+                QHeaderView::section { background-color: #27251f; color: #d8d3c7; padding: 6px; }
+            """)
+            self.record_dialog.resize(780, 420)
+            layout = QVBoxLayout(self.record_dialog)
+            self.record_info = QLabel()
+            self.record_info.setWordWrap(True)
+            layout.addWidget(self.record_info)
+            self.record_table = QTableWidget(0, 7)
+            self.record_table.setHorizontalHeaderLabels(["Відлік", *CHANNEL_NAMES])
+            self.record_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            self.record_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            layout.addWidget(self.record_table)
+            layout.addWidget(QLabel("Показано останні 100 записів. У CSV зберігаються всі записані відліки."))
+        self._update_recording_preview()
+        self.record_dialog.show()
+        self.record_dialog.raise_()
+
+    def _update_recording_preview(self) -> None:
+        if self.record_dialog is None:
+            return
+        state = "Триває запис" if self._record_file is not None else "Запис зупинено"
+        path = getattr(self, "_record_path", "Файл ще не вибрано")
+        self.record_info.setText(f"{state} · Рядків: {self._recorded_rows}\n{path}")
+        if self._record_preview_dirty:
+            self.record_table.setUpdatesEnabled(False)
+            self.record_table.setRowCount(len(self._record_preview_rows))
+            for row, values in enumerate(self._record_preview_rows):
+                for column, value in enumerate(values):
+                    self.record_table.setItem(row, column, QTableWidgetItem(str(value)))
+            self.record_table.scrollToBottom()
+            self.record_table.setUpdatesEnabled(True)
+            self._record_preview_dirty = False
+
+    def _stop_recording(self) -> None:
+        record_file = self._record_file
+        self._record_file = None
+        self._csv_writer = None
+        self.record_btn.setText("Запис у CSV")
+        self.record_btn.setStyleSheet("")
+        self.record_btn.setToolTip("")
+        if record_file is not None:
+            try:
+                record_file.close()
+            except OSError as exc:
+                QMessageBox.warning(self, "Помилка збереження CSV", str(exc))
+        self._update_recording_preview()
+
+    def _recording_error(self, exc: OSError) -> None:
+        self._stop_recording()
+        QMessageBox.warning(self, "Помилка запису CSV", str(exc))
 
     def _render_plots(self) -> None:
+        if self._record_preview_dirty:
+            self._update_recording_preview()
         if not self._plots_dirty:
             return
         sample_numbers = list(self._sample_numbers)
@@ -290,12 +431,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._disconnect_port()
+        if self.record_dialog is not None:
+            self.record_dialog.close()
         super().closeEvent(event)
 
     def _update_connection_state(self) -> None:
         self.port_combo.setEnabled(not self.connected)
         self.baud_combo.setEnabled(not self.connected)
         self.refresh_btn.setEnabled(not self.connected)
+        self.record_btn.setEnabled(self.connected)
 
         if self.connected:
             self.connect_btn.setText("Відключити")
