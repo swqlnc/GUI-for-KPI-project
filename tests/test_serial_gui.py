@@ -5,9 +5,9 @@ import csv
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, QSettings, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QTableWidget
 from main_window import MainWindow, CHANNEL_NAMES, MAX_READ_BYTES
 
 
@@ -37,7 +37,10 @@ class SerialGuiTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
-        self.window = MainWindow()
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.settings = QSettings(str(Path(directory) / 'test.ini'), QSettings.Format.IniFormat)
+        with patch('main_window.QSettings', return_value=self.settings):
+            self.window = MainWindow()
         self.port = BufferedPort()
         self.window.serial_port = self.port
 
@@ -67,6 +70,46 @@ class SerialGuiTests(unittest.TestCase):
         self.window._update_connection_state()
         with patch('main_window.QFileDialog.getSaveFileName', return_value=(str(path), 'CSV (*.csv)')):
             self.window.record_btn.click()
+
+    def test_calibration_applies_to_graphs_and_csv_and_is_saved(self):
+        path = Path(self.settings.fileName()).with_name('calibrated.csv')
+        self.start_recording(path)
+        self.receive(b'1 2 3 4 5 6\n')
+        invalid_was_rejected = []
+
+        def fill_table():
+            dialog = self.app.activeModalWidget()
+            table = dialog.findChild(QTableWidget)
+            button = dialog.findChild(QDialogButtonBox).buttons()[0]
+            table.cellWidget(0, 0).setText('NaN')
+            button.click()
+            invalid_was_rejected.append(dialog.isVisible())
+            table.cellWidget(0, 0).setText('2,5')
+            table.cellWidget(0, 1).setText('-1')
+            table.cellWidget(5, 1).setText('10')
+            button.click()
+            if dialog.isVisible():
+                dialog.reject()
+
+        QTimer.singleShot(0, fill_table)
+        self.window.calibration_btn.click()
+        self.assertEqual(invalid_was_rejected, [True])
+        self.receive(b'1 2 3 4 5 6\n')
+        self.window._render_plots()
+        self.assertEqual(list(self.window.channel_curves['X1'].getData()[1]), [1.0, 1.5])
+        self.assertEqual(self.window.record_table.item(1, 6).text(), '16.0')
+        self.assertEqual(self.window.data_log.toPlainText().splitlines(), ['1 2 3 4 5 6'] * 2)
+        self.window._stop_recording()
+        with path.open(encoding='utf-8-sig', newline='') as stream:
+            self.assertEqual(list(csv.reader(stream, delimiter=';'))[-1],
+                             ['2', '1.5', '2.0', '3.0', '4.0', '5.0', '16.0'])
+        with patch('main_window.QSettings', return_value=self.settings):
+            reopened = MainWindow()
+        try:
+            self.assertEqual(reopened._coefficients[0], (2.5, -1.0))
+            self.assertEqual(reopened._coefficients[-1], (1.0, 10.0))
+        finally:
+            reopened.close()
 
     def test_csv_records_all_valid_samples_and_stops_on_disconnect(self):
         with tempfile.TemporaryDirectory() as directory:

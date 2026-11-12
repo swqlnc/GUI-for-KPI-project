@@ -1,18 +1,21 @@
 from collections import deque
 import csv
 from datetime import datetime
+import json
 import math
 
 import pyqtgraph as pg
 import serial
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -29,6 +32,7 @@ from serial.tools import list_ports
 BAUD_RATES = [9600, 57600, 115200]
 CHANNEL_NAMES = ("X1", "Y1", "Z1", "X2", "Y2", "Z2")
 CHANNEL_COLORS = ("#6fdc8c", "#e0a94a", "#5ea7b8")
+DEFAULT_COEFFICIENTS = ((1.0, 0.0),) * len(CHANNEL_NAMES)
 MAX_READ_BYTES = 65536
 
 STYLE = """
@@ -79,6 +83,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Прийом даних з COM-порту")
         self.resize(1000, 540)
         self.setStyleSheet(STYLE)
+        self._settings = QSettings("SerialMonitor", "SerialMonitor")
+        self._coefficients = self._load_coefficients()
         self.connected = False
         self.serial_port = None
         self._record_file = None
@@ -149,6 +155,10 @@ class MainWindow(QMainWindow):
         self.preview_btn.clicked.connect(self._show_recording_preview)
         row.addWidget(self.preview_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
+        self.calibration_btn = QPushButton("Калібрування")
+        self.calibration_btn.clicked.connect(self._edit_coefficients)
+        row.addWidget(self.calibration_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
         row.addStretch()
 
         status_box = QHBoxLayout()
@@ -161,6 +171,88 @@ class MainWindow(QMainWindow):
         row.addLayout(status_box)
 
         return row
+
+    def _load_coefficients(self) -> tuple[tuple[float, float], ...]:
+        try:
+            coefficients = tuple(
+                (float(scale), float(offset))
+                for scale, offset in json.loads(self._settings.value("calibration/coefficients", "[]"))
+            )
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_COEFFICIENTS
+        if len(coefficients) != len(CHANNEL_NAMES) or not all(
+            math.isfinite(value) for pair in coefficients for value in pair
+        ):
+            return DEFAULT_COEFFICIENTS
+        return coefficients
+
+    def _edit_coefficients(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Паспортні коефіцієнти")
+        dialog.setMinimumWidth(530)
+        dialog.setStyleSheet("""
+            QDialog { background-color: #1b1a17; }
+            QTableWidget { background-color: #0c1310; gridline-color: #38352f; }
+            QHeaderView::section { background-color: #27251f; color: #d8d3c7; padding: 6px; }
+            QLineEdit { background-color: #171614; border: 1px solid #575249; padding: 3px 6px; }
+            QLineEdit:focus { border-color: #6fdc8c; }
+        """)
+        layout = QVBoxLayout(dialog)
+        description = QLabel("Вихід = вхід × k + b. Зміни діють з наступного відліку.")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        table = QTableWidget(len(CHANNEL_NAMES), 2)
+        table.setHorizontalHeaderLabels(["Масштаб (k)", "Зміщення нуля (b)"])
+        table.setVerticalHeaderLabels(CHANNEL_NAMES)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setMinimumHeight(table.horizontalHeader().sizeHint().height() + sum(
+            table.rowHeight(row) for row in range(table.rowCount())
+        ) + 4)
+        layout.addWidget(table)
+        for row, pair in enumerate(self._coefficients):
+            for column, value in enumerate(pair):
+                field = QLineEdit(repr(value))
+                field.setAccessibleName(f"{CHANNEL_NAMES[row]} — {table.horizontalHeaderItem(column).text()}")
+                table.setCellWidget(row, column, field)
+
+        error = QLabel()
+        error.setWordWrap(True)
+        error.setStyleSheet("color: #ff9c8f;")
+        layout.addWidget(error)
+        buttons = QDialogButtonBox()
+        apply_button = buttons.addButton("Застосувати", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Скасувати", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(buttons)
+
+        def apply_coefficients() -> None:
+            coefficients = []
+            for row, channel in enumerate(CHANNEL_NAMES):
+                pair = []
+                for column in range(table.columnCount()):
+                    field = table.cellWidget(row, column)
+                    try:
+                        value = float(field.text().strip().replace(",", "."))
+                    except ValueError:
+                        value = math.nan
+                    if not math.isfinite(value):
+                        error.setText(f"{channel}: введіть скінченне число в полі «{table.horizontalHeaderItem(column).text()}».")
+                        field.setFocus()
+                        field.selectAll()
+                        return
+                    pair.append(value)
+                coefficients.append(tuple(pair))
+            self._settings.setValue("calibration/coefficients", json.dumps(coefficients))
+            self._settings.sync()
+            if self._settings.status() != QSettings.Status.NoError:
+                error.setText("Не вдалося зберегти коефіцієнти.")
+                return
+            self._coefficients = tuple(coefficients)
+            dialog.accept()
+
+        apply_button.clicked.connect(apply_coefficients)
+        buttons.rejected.connect(dialog.reject)
+        dialog.exec()
+        dialog.deleteLater()
 
     def _build_data_views(self) -> QVBoxLayout:
         col = QVBoxLayout()
@@ -311,6 +403,13 @@ class MainWindow(QMainWindow):
             return
         if len(values) != 6 or not all(math.isfinite(value) for value in values):
             return
+        if self._coefficients != DEFAULT_COEFFICIENTS:
+            values = [
+                value * scale + offset
+                for value, (scale, offset) in zip(values, self._coefficients)
+            ]
+            if not all(math.isfinite(value) for value in values):
+                return
         self._sample_number += 1
         self._sample_numbers.append(self._sample_number)
         for name, value in zip(CHANNEL_NAMES, values):
